@@ -195,3 +195,263 @@
         ))
     )
 )
+
+
+(define-public (update-service-area (area (string-ascii 50)) (min-stake uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (map-set ServiceAreas area
+            {
+                min-stake: min-stake,
+                active-couriers: u0
+            }
+        ))
+    )
+)
+
+
+(define-map UserRatings
+    { rater: principal, rated: principal }
+    { rating: uint, timestamp: uint }
+)
+
+(define-map AggregateRatings
+    principal
+    { total-rating: uint, rating-count: uint }
+)
+
+(define-constant MAX_RATING u5)
+
+(define-public (submit-rating (rated-user principal) (rating uint))
+    (let (
+        (job-id (- (var-get delivery-counter) u1))
+        (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+        (current-aggregate (default-to { total-rating: u0, rating-count: u0 } 
+            (map-get? AggregateRatings rated-user)))
+    )
+        (asserts! (<= rating MAX_RATING) (err u200))
+        (asserts! (or 
+            (is-eq tx-sender (get customer job))
+            (is-eq (some tx-sender) (get courier job))
+        ) err-unauthorized)
+        
+        (map-set UserRatings { rater: tx-sender, rated: rated-user }
+            { rating: rating, timestamp: stacks-block-height }
+        )
+        
+        (ok (map-set AggregateRatings rated-user
+            {
+                total-rating: (+ (get total-rating current-aggregate) rating),
+                rating-count: (+ (get rating-count current-aggregate) u1)
+            }
+        ))
+    )
+)
+
+
+(define-public (get-user-rating (rated-user principal))
+    (let (
+        (aggregate (unwrap! (map-get? AggregateRatings rated-user) err-not-found))
+    )
+        (ok {
+            average-rating: (/ (get total-rating aggregate) (get rating-count aggregate)),
+            total-ratings: (get rating-count aggregate)
+        })
+    )
+)
+
+
+(define-map Disputes 
+    uint 
+    {
+        job-id: uint,
+        complainant: principal,
+        defendant: principal,
+        reason: (string-ascii 100),
+        status: uint,
+        timestamp: uint
+    }
+)
+
+(define-data-var dispute-counter uint u0)
+(define-constant DISPUTE_OPEN u1)
+(define-constant DISPUTE_RESOLVED u2)
+
+(define-public (file-dispute (job-id uint) (reason (string-ascii 100)))
+    (let (
+        (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+        (dispute-id (+ (var-get dispute-counter) u1))
+    )
+        (asserts! (or 
+            (is-eq tx-sender (get customer job))
+            (is-eq (some tx-sender) (get courier job))
+        ) err-unauthorized)
+        
+        (var-set dispute-counter dispute-id)
+        (ok (map-set Disputes dispute-id
+            {
+                job-id: job-id,
+                complainant: tx-sender,
+                defendant: (if (is-eq tx-sender (get customer job))
+                    (unwrap! (get courier job) err-not-found)
+                    (get customer job)),
+                reason: reason,
+                status: DISPUTE_OPEN,
+                timestamp: stacks-block-height
+            }
+        ))
+    )
+)
+
+
+(define-public (resolve-dispute (dispute-id uint) (resolution uint))
+    (let (
+        (dispute (unwrap! (map-get? Disputes dispute-id) err-not-found))
+    )
+        (asserts! (is-eq tx-sender (get complainant dispute)) err-unauthorized)
+        (asserts! (is-eq (get status dispute) DISPUTE_OPEN) err-invalid-status)
+        
+        ;; Update dispute status
+        (ok (map-set Disputes dispute-id
+            {
+                job-id: (get job-id dispute),
+                complainant: tx-sender,
+                defendant: (get defendant dispute),
+                reason: (get reason dispute),
+                status: resolution,
+                timestamp: stacks-block-height
+            }
+        ))
+    )
+)
+
+
+(define-map SecurityDeposits
+    uint
+    {
+        amount: uint,
+        depositor: principal,
+        refundable: bool
+    }
+)
+
+(define-constant SECURITY_DEPOSIT_AMOUNT u500)
+
+(define-public (add-security-deposit (job-id uint))
+    (let (
+        (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+    )
+        (asserts! (is-eq tx-sender (get customer job)) err-unauthorized)
+        (try! (stx-transfer? SECURITY_DEPOSIT_AMOUNT tx-sender (as-contract tx-sender)))
+        
+        (ok (map-set SecurityDeposits job-id
+            {
+                amount: SECURITY_DEPOSIT_AMOUNT,
+                depositor: tx-sender,
+                refundable: true
+            }
+        ))
+    )
+)
+
+(define-public (refund-security-deposit (job-id uint))
+    (let (
+        (deposit (unwrap! (map-get? SecurityDeposits job-id) err-not-found))
+        (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+    )
+        (asserts! (is-eq (get status job) STATUS_DELIVERED) err-invalid-status)
+        (asserts! (get refundable deposit) err-unauthorized)
+        (try! (as-contract (stx-transfer? (get amount deposit) tx-sender (get depositor deposit))))
+        
+        (ok (map-set SecurityDeposits job-id
+            (merge deposit { refundable: false })
+        ))
+    )
+)
+
+(define-map DeliveryIncentives
+    uint
+    {
+        base-amount: uint,
+        bonus-amount: uint,
+        deadline: uint,
+        claimed: bool
+    }
+)
+
+(define-constant BONUS_PERCENTAGE u10)
+
+(define-public (set-delivery-incentive (job-id uint) (deadline uint))
+    (let (
+        (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+        (bonus (/ (* (get payment-amount job) BONUS_PERCENTAGE) u100))
+    )
+        (asserts! (is-eq tx-sender (get customer job)) err-unauthorized)
+        
+        (ok (map-set DeliveryIncentives job-id
+            {
+                base-amount: (get payment-amount job),
+                bonus-amount: bonus,
+                deadline: deadline,
+                claimed: false
+            }
+        ))
+    )
+)
+
+(define-public (claim-time-bonus (job-id uint))
+    (let (
+        (incentive (unwrap! (map-get? DeliveryIncentives job-id) err-not-found))
+        (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+    )
+        (asserts! (is-eq (some tx-sender) (get courier job)) err-unauthorized)
+        (asserts! (is-eq (get status job) STATUS_DELIVERED) err-invalid-status)
+        (asserts! (< stacks-block-height (get deadline incentive)) err-unauthorized)
+        (asserts! (not (get claimed incentive)) err-unauthorized)
+        
+        (try! (as-contract (stx-transfer? (get bonus-amount incentive) tx-sender tx-sender)))
+        
+        (ok (map-set DeliveryIncentives job-id
+            (merge incentive { claimed: true })
+        ))
+    )
+)
+
+
+(define-map CourierSpecialization
+    { courier: principal, service-type: (string-ascii 20) }
+    { certified: bool, experience-points: uint }
+)
+
+(define-constant SERVICE_TYPE_FOOD "food")
+(define-constant SERVICE_TYPE_MEDICAL "medical")
+(define-constant SERVICE_TYPE_EXPRESS "express")
+
+(define-public (register-specialization (service-type (string-ascii 20)))
+    (let (
+        (courier-stake (unwrap! (map-get? CourierStakes tx-sender) err-unauthorized))
+    )
+        (asserts! (get active courier-stake) err-unauthorized)
+        
+        (ok (map-set CourierSpecialization { courier: tx-sender, service-type: service-type }
+            {
+                certified: false,
+                experience-points: u0
+            }
+        ))
+    )
+)
+
+(define-public (add-experience-points (courier principal) (service-type (string-ascii 20)) (points uint))
+    (let (
+        (spec (unwrap! (map-get? CourierSpecialization { courier: courier, service-type: service-type }) err-not-found))
+    )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        
+        (ok (map-set CourierSpecialization { courier: courier, service-type: service-type }
+            (merge spec { experience-points: (+ (get experience-points spec) points) })
+        ))
+    )
+)
+
+
