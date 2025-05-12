@@ -455,3 +455,110 @@
 )
 
 
+
+
+
+(define-map InsurancePool
+    principal
+    {
+        insured-amount: uint,
+        coverage-expiry: uint,
+        claims-made: uint
+    }
+)
+
+(define-constant INSURANCE_PERIOD u52560)
+(define-constant MIN_INSURANCE_AMOUNT u1000)
+
+(define-public (join-insurance-pool (amount uint))
+    (let (
+        (current-insurance (default-to 
+            { insured-amount: u0, coverage-expiry: u0, claims-made: u0 }
+            (map-get? InsurancePool tx-sender)
+        ))
+    )
+        (asserts! (>= amount MIN_INSURANCE_AMOUNT) err-insufficient-stake)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        (ok (map-set InsurancePool tx-sender
+            {
+                insured-amount: amount,
+                coverage-expiry: (+ stacks-block-height INSURANCE_PERIOD),
+                claims-made: u0
+            }
+        ))
+    )
+)
+
+(define-public (claim-insurance (job-id uint) (claim-amount uint))
+    (let (
+        (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+        (insurance (unwrap! (map-get? InsurancePool tx-sender) err-not-found))
+    )
+        (asserts! (is-eq (some tx-sender) (get courier job)) err-unauthorized)
+        (asserts! (<= claim-amount (get insured-amount insurance)) err-unauthorized)
+        (asserts! (< stacks-block-height (get coverage-expiry insurance)) err-unauthorized)
+        
+        (try! (as-contract (stx-transfer? claim-amount tx-sender tx-sender)))
+        
+        (ok (map-set InsurancePool tx-sender
+            (merge insurance 
+                { claims-made: (+ (get claims-made insurance) u1) }
+            )
+        ))
+    )
+)
+
+
+(define-map DemandMetrics
+    (string-ascii 50)
+    {
+        active-jobs: uint,
+        base-price-multiplier: uint,
+        last-updated: uint
+    }
+)
+
+(define-constant MAX_MULTIPLIER u300)
+(define-constant MIN_MULTIPLIER u100)
+(define-constant UPDATE_INTERVAL u144)
+
+(define-public (update-demand-metrics (area (string-ascii 50)))
+    (let (
+        (current-metrics (default-to 
+            { active-jobs: u0, base-price-multiplier: u100, last-updated: u0 }
+            (map-get? DemandMetrics area)
+        ))
+        (service-area (unwrap! (map-get? ServiceAreas area) err-not-found))
+    )
+        (asserts! (>= (- stacks-block-height (get last-updated current-metrics)) UPDATE_INTERVAL) err-unauthorized)
+        
+        (ok (map-set DemandMetrics area
+            {
+                active-jobs: (var-get delivery-counter),
+                base-price-multiplier: (calculate-multiplier 
+                    (get active-couriers service-area)
+                    (var-get delivery-counter)
+                ),
+                last-updated: stacks-block-height
+            }
+        ))
+    )
+)
+
+(define-private (min-uint (a uint) (b uint))
+    (if (<= a b) a b))
+
+(define-private (max-uint (a uint) (b uint))
+    (if (>= a b) a b))
+
+(define-private (calculate-multiplier (couriers uint) (jobs uint))
+    (if (is-eq couriers u0)
+        MAX_MULTIPLIER
+        (min-uint MAX_MULTIPLIER 
+            (max-uint MIN_MULTIPLIER 
+                (* u100 (/ jobs couriers))
+            )
+        )
+    )
+)
