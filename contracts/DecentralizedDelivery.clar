@@ -9,6 +9,30 @@
 (define-constant err-invalid-status (err u103))
 (define-constant err-insufficient-stake (err u104))
 
+
+(define-map EscrowHoldings
+    uint
+    {
+        amount: uint,
+        customer: principal,
+        courier: (optional principal),
+        locked: bool,
+        created-at: uint,
+        expires-at: uint
+    }
+)
+
+(define-map EscrowBalances
+    principal
+    uint
+)
+
+(define-constant ESCROW_TIMEOUT u1008)
+(define-constant err-escrow-locked (err u105))
+(define-constant err-escrow-expired (err u106))
+(define-constant err-insufficient-balance (err u107))
+
+
 ;; Data Variables
 (define-data-var min-stake-amount uint u1000)
 (define-data-var delivery-counter uint u0)
@@ -561,4 +585,149 @@
             )
         )
     )
+)
+
+
+
+(define-public (create-delivery-job-with-escrow (pickup (string-ascii 50)) (delivery (string-ascii 50)) (payment uint))
+    (let
+        (
+            (job-id (+ (var-get delivery-counter) u1))
+            (customer-balance (default-to u0 (map-get? EscrowBalances tx-sender)))
+        )
+        (asserts! (>= customer-balance payment) err-insufficient-balance)
+        
+        (map-set EscrowHoldings job-id
+            {
+                amount: payment,
+                customer: tx-sender,
+                courier: none,
+                locked: true,
+                created-at: stacks-block-height,
+                expires-at: (+ stacks-block-height ESCROW_TIMEOUT)
+            }
+        )
+        
+        (map-set EscrowBalances tx-sender (- customer-balance payment))
+        
+        (map-set DeliveryJobs job-id
+            {
+                customer: tx-sender,
+                courier: none,
+                pickup-location: pickup,
+                delivery-location: delivery,
+                payment-amount: payment,
+                status: STATUS_PENDING,
+                timestamp: stacks-block-height
+            }
+        )
+        
+        (var-set delivery-counter job-id)
+        (ok job-id)
+    )
+)
+
+(define-public (deposit-to-escrow (amount uint))
+    (let
+        ((current-balance (default-to u0 (map-get? EscrowBalances tx-sender))))
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (ok (map-set EscrowBalances tx-sender (+ current-balance amount)))
+    )
+)
+
+(define-public (complete-delivery-with-escrow (job-id uint))
+    (let
+        (
+            (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+            (escrow (unwrap! (map-get? EscrowHoldings job-id) err-not-found))
+            (courier (unwrap! (get courier job) err-unauthorized))
+            (courier-stake (unwrap! (map-get? CourierStakes courier) err-not-found))
+        )
+        (asserts! (is-eq courier tx-sender) err-unauthorized)
+        (asserts! (is-eq (get status job) STATUS_IN_TRANSIT) err-invalid-status)
+        (asserts! (get locked escrow) err-escrow-locked)
+        
+        (try! (as-contract (stx-transfer? (get amount escrow) tx-sender courier)))
+        
+        (map-set EscrowHoldings job-id
+            (merge escrow { locked: false })
+        )
+        
+        (map-set CourierStakes courier
+            (merge courier-stake {
+                total-deliveries: (+ (get total-deliveries courier-stake) u1)
+            })
+        )
+        
+        (ok (map-set DeliveryJobs job-id
+            (merge job { status: STATUS_DELIVERED })
+        ))
+    )
+)
+
+(define-public (cancel-delivery-with-refund (job-id uint))
+    (let
+        (
+            (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+            (escrow (unwrap! (map-get? EscrowHoldings job-id) err-not-found))
+            (customer-balance (default-to u0 (map-get? EscrowBalances (get customer escrow))))
+        )
+        (asserts! (is-eq tx-sender (get customer job)) err-unauthorized)
+        (asserts! (is-eq (get status job) STATUS_PENDING) err-invalid-status)
+        (asserts! (get locked escrow) err-escrow-locked)
+        
+        (map-set EscrowBalances (get customer escrow) 
+            (+ customer-balance (get amount escrow))
+        )
+        
+        (map-set EscrowHoldings job-id
+            (merge escrow { locked: false })
+        )
+        
+        (ok (map-set DeliveryJobs job-id
+            (merge job { status: STATUS_CANCELLED })
+        ))
+    )
+)
+
+(define-public (withdraw-from-escrow (amount uint))
+    (let
+        ((current-balance (default-to u0 (map-get? EscrowBalances tx-sender))))
+        (asserts! (>= current-balance amount) err-insufficient-balance)
+        (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+        (ok (map-set EscrowBalances tx-sender (- current-balance amount)))
+    )
+)
+
+(define-public (claim-expired-escrow (job-id uint))
+    (let
+        (
+            (escrow (unwrap! (map-get? EscrowHoldings job-id) err-not-found))
+            (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+            (customer-balance (default-to u0 (map-get? EscrowBalances (get customer escrow))))
+        )
+        (asserts! (> stacks-block-height (get expires-at escrow)) err-escrow-expired)
+        (asserts! (get locked escrow) err-escrow-locked)
+        (asserts! (not (is-eq (get status job) STATUS_DELIVERED)) err-invalid-status)
+        
+        (map-set EscrowBalances (get customer escrow) 
+            (+ customer-balance (get amount escrow))
+        )
+        
+        (map-set EscrowHoldings job-id
+            (merge escrow { locked: false })
+        )
+        
+        (ok (map-set DeliveryJobs job-id
+            (merge job { status: STATUS_CANCELLED })
+        ))
+    )
+)
+
+(define-read-only (get-escrow-balance (user principal))
+    (default-to u0 (map-get? EscrowBalances user))
+)
+
+(define-read-only (get-escrow-holding (job-id uint))
+    (map-get? EscrowHoldings job-id)
 )
