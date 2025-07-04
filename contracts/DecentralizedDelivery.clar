@@ -731,3 +731,185 @@
 (define-read-only (get-escrow-holding (job-id uint))
     (map-get? EscrowHoldings job-id)
 )
+
+(define-map DeliverySignatures
+    uint
+    {
+        customer-signed: bool,
+        courier-signed: bool,
+        third-party-signed: bool,
+        third-party-validator: (optional principal),
+        signatures-required: uint,
+        signatures-collected: uint,
+        completion-timestamp: uint
+    }
+)
+
+(define-constant SIGNATURE_CUSTOMER u1)
+(define-constant SIGNATURE_COURIER u2)
+(define-constant SIGNATURE_THIRD_PARTY u3)
+(define-constant MIN_SIGNATURES_DEFAULT u2)
+(define-constant MIN_SIGNATURES_HIGH_VALUE u3)
+(define-constant HIGH_VALUE_THRESHOLD u5000)
+
+(define-public (initialize-delivery-signatures (job-id uint) (third-party-validator (optional principal)))
+    (let
+        (
+            (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+            (required-signatures (if (>= (get payment-amount job) HIGH_VALUE_THRESHOLD)
+                MIN_SIGNATURES_HIGH_VALUE
+                MIN_SIGNATURES_DEFAULT))
+        )
+        (asserts! (is-eq tx-sender (get customer job)) err-unauthorized)
+        (asserts! (is-eq (get status job) STATUS_PENDING) err-invalid-status)
+        
+        (ok (map-set DeliverySignatures job-id
+            {
+                customer-signed: false,
+                courier-signed: false,
+                third-party-signed: false,
+                third-party-validator: third-party-validator,
+                signatures-required: required-signatures,
+                signatures-collected: u0,
+                completion-timestamp: u0
+            }
+        ))
+    )
+)
+
+(define-public (sign-delivery-completion (job-id uint) (signature-type uint))
+    (let
+        (
+            (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+            (signatures (unwrap! (map-get? DeliverySignatures job-id) err-not-found))
+        )
+        (asserts! (is-eq (get status job) STATUS_IN_TRANSIT) err-invalid-status)
+        
+        (if (is-eq signature-type SIGNATURE_CUSTOMER)
+            (begin
+                (asserts! (is-eq tx-sender (get customer job)) err-unauthorized)
+                (asserts! (not (get customer-signed signatures)) err-unauthorized)
+                (ok (map-set DeliverySignatures job-id
+                    (merge signatures {
+                        customer-signed: true,
+                        signatures-collected: (+ (get signatures-collected signatures) u1)
+                    })
+                ))
+            )
+            (if (is-eq signature-type SIGNATURE_COURIER)
+                (begin
+                    (asserts! (is-eq (some tx-sender) (get courier job)) err-unauthorized)
+                    (asserts! (not (get courier-signed signatures)) err-unauthorized)
+                    (ok (map-set DeliverySignatures job-id
+                        (merge signatures {
+                            courier-signed: true,
+                            signatures-collected: (+ (get signatures-collected signatures) u1)
+                        })
+                    ))
+                )
+                (if (is-eq signature-type SIGNATURE_THIRD_PARTY)
+                    (begin
+                        (asserts! (is-eq (some tx-sender) (get third-party-validator signatures)) err-unauthorized)
+                        (asserts! (not (get third-party-signed signatures)) err-unauthorized)
+                        (ok (map-set DeliverySignatures job-id
+                            (merge signatures {
+                                third-party-signed: true,
+                                signatures-collected: (+ (get signatures-collected signatures) u1)
+                            })
+                        ))
+                    )
+                    err-invalid-status
+                )
+            )
+        )
+    )
+)
+
+(define-public (complete-delivery-with-signatures (job-id uint))
+    (let
+        (
+            (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+            (signatures (unwrap! (map-get? DeliverySignatures job-id) err-not-found))
+            (courier (unwrap! (get courier job) err-unauthorized))
+            (courier-stake (unwrap! (map-get? CourierStakes courier) err-not-found))
+        )
+        (asserts! (is-eq (get status job) STATUS_IN_TRANSIT) err-invalid-status)
+        (asserts! (>= (get signatures-collected signatures) (get signatures-required signatures)) err-unauthorized)
+        (asserts! (get customer-signed signatures) err-unauthorized)
+        (asserts! (get courier-signed signatures) err-unauthorized)
+        
+        (if (is-eq (get signatures-required signatures) MIN_SIGNATURES_HIGH_VALUE)
+            (asserts! (get third-party-signed signatures) err-unauthorized)
+            true
+        )
+        
+        (try! (stx-transfer? (get payment-amount job) (get customer job) courier))
+        
+        (map-set DeliverySignatures job-id
+            (merge signatures { completion-timestamp: stacks-block-height })
+        )
+        
+        (map-set CourierStakes courier
+            (merge courier-stake {
+                total-deliveries: (+ (get total-deliveries courier-stake) u1)
+            })
+        )
+        
+        (ok (map-set DeliveryJobs job-id
+            (merge job { status: STATUS_DELIVERED })
+        ))
+    )
+)
+
+(define-public (complete-delivery-with-escrow-signatures (job-id uint))
+    (let
+        (
+            (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+            (escrow (unwrap! (map-get? EscrowHoldings job-id) err-not-found))
+            (signatures (unwrap! (map-get? DeliverySignatures job-id) err-not-found))
+            (courier (unwrap! (get courier job) err-unauthorized))
+            (courier-stake (unwrap! (map-get? CourierStakes courier) err-not-found))
+        )
+        (asserts! (is-eq (get status job) STATUS_IN_TRANSIT) err-invalid-status)
+        (asserts! (get locked escrow) err-escrow-locked)
+        (asserts! (>= (get signatures-collected signatures) (get signatures-required signatures)) err-unauthorized)
+        (asserts! (get customer-signed signatures) err-unauthorized)
+        (asserts! (get courier-signed signatures) err-unauthorized)
+        
+        (if (is-eq (get signatures-required signatures) MIN_SIGNATURES_HIGH_VALUE)
+            (asserts! (get third-party-signed signatures) err-unauthorized)
+            true
+        )
+        
+        (try! (as-contract (stx-transfer? (get amount escrow) tx-sender courier)))
+        
+        (map-set EscrowHoldings job-id
+            (merge escrow { locked: false })
+        )
+        
+        (map-set DeliverySignatures job-id
+            (merge signatures { completion-timestamp: stacks-block-height })
+        )
+        
+        (map-set CourierStakes courier
+            (merge courier-stake {
+                total-deliveries: (+ (get total-deliveries courier-stake) u1)
+            })
+        )
+        
+        (ok (map-set DeliveryJobs job-id
+            (merge job { status: STATUS_DELIVERED })
+        ))
+    )
+)
+
+(define-read-only (get-delivery-signatures (job-id uint))
+    (map-get? DeliverySignatures job-id)
+)
+
+(define-read-only (is-delivery-ready-for-completion (job-id uint))
+    (match (map-get? DeliverySignatures job-id)
+        signatures (ok (>= (get signatures-collected signatures) (get signatures-required signatures)))
+        err-not-found
+    )
+)
