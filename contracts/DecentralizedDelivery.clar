@@ -913,3 +913,293 @@
         err-not-found
     )
 )
+
+;; Package Tracking and Proof-of-Delivery System
+;; Provides real-time tracking with immutable proof records
+
+(define-map PackageTrackingData
+    uint ;; job-id
+    {
+        package-weight: uint,
+        package-dimensions: (string-ascii 30), ;; "LxWxH in cm"
+        special-instructions: (string-ascii 100),
+        fragile-item: bool,
+        temperature-sensitive: bool,
+        tracking-active: bool,
+        pickup-verified: bool,
+        delivery-verified: bool
+    }
+)
+
+(define-map TrackingEvents
+    { job-id: uint, event-id: uint }
+    {
+        event-type: uint,
+        timestamp: uint,
+        location-coords: (string-ascii 50), ;; "lat,lng"
+        location-description: (string-ascii 50),
+        courier: principal,
+        photo-hash: (optional (string-ascii 64)), ;; IPFS hash or similar
+        notes: (string-ascii 100),
+        verified: bool
+    }
+)
+
+(define-map TrackingCounters
+    uint ;; job-id
+    uint ;; event-counter
+)
+
+(define-map DeliveryProofs
+    uint ;; job-id
+    {
+        pickup-photo-hash: (optional (string-ascii 64)),
+        delivery-photo-hash: (optional (string-ascii 64)),
+        recipient-signature-hash: (optional (string-ascii 64)),
+        package-condition-rating: uint, ;; 1-5 scale
+        delivery-confirmation-code: (string-ascii 10),
+        proof-timestamp: uint,
+        witness-address: (optional principal)
+    }
+)
+
+;; Event type constants
+(define-constant EVENT_PICKUP_INITIATED u1)
+(define-constant EVENT_PICKUP_COMPLETED u2)
+(define-constant EVENT_IN_TRANSIT u3)
+(define-constant EVENT_DELIVERY_ATTEMPTED u4)
+(define-constant EVENT_DELIVERY_COMPLETED u5)
+(define-constant EVENT_EXCEPTION_OCCURRED u6)
+
+;; Error constants for tracking
+(define-constant err-tracking-not-active (err u300))
+(define-constant err-invalid-event-type (err u301))
+(define-constant err-proof-already-submitted (err u302))
+(define-constant err-invalid-condition-rating (err u303))
+
+;; Initialize package tracking for a delivery job
+(define-public (initialize-package-tracking 
+    (job-id uint) 
+    (weight uint) 
+    (dimensions (string-ascii 30))
+    (special-instructions (string-ascii 100))
+    (fragile bool)
+    (temp-sensitive bool))
+    (let
+        ((job (unwrap! (map-get? DeliveryJobs job-id) err-not-found)))
+        ;; Only customer can initialize tracking
+        (asserts! (is-eq tx-sender (get customer job)) err-unauthorized)
+        (asserts! (is-eq (get status job) STATUS_PENDING) err-invalid-status)
+        
+        ;; Set initial tracking data
+        (map-set PackageTrackingData job-id
+            {
+                package-weight: weight,
+                package-dimensions: dimensions,
+                special-instructions: special-instructions,
+                fragile-item: fragile,
+                temperature-sensitive: temp-sensitive,
+                tracking-active: true,
+                pickup-verified: false,
+                delivery-verified: false
+            }
+        )
+        
+        ;; Initialize event counter
+        (map-set TrackingCounters job-id u0)
+        
+        (ok true)
+    )
+)
+
+;; Record a tracking event during delivery
+(define-public (record-tracking-event
+    (job-id uint)
+    (event-type uint)
+    (location-coords (string-ascii 50))
+    (location-desc (string-ascii 50))
+    (photo-hash (optional (string-ascii 64)))
+    (notes (string-ascii 100)))
+    (let
+        (
+            (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+            (tracking-data (unwrap! (map-get? PackageTrackingData job-id) err-not-found))
+            (current-counter (default-to u0 (map-get? TrackingCounters job-id)))
+            (new-event-id (+ current-counter u1))
+        )
+        ;; Only assigned courier can record events
+        (asserts! (is-eq (some tx-sender) (get courier job)) err-unauthorized)
+        (asserts! (get tracking-active tracking-data) err-tracking-not-active)
+        (asserts! (and (>= event-type u1) (<= event-type u6)) err-invalid-event-type)
+        
+        ;; Record the tracking event
+        (map-set TrackingEvents { job-id: job-id, event-id: new-event-id }
+            {
+                event-type: event-type,
+                timestamp: stacks-block-height,
+                location-coords: location-coords,
+                location-description: location-desc,
+                courier: tx-sender,
+                photo-hash: photo-hash,
+                notes: notes,
+                verified: true
+            }
+        )
+        
+        ;; Update event counter
+        (map-set TrackingCounters job-id new-event-id)
+        
+        ;; Update pickup/delivery verification status
+        (if (is-eq event-type EVENT_PICKUP_COMPLETED)
+            (map-set PackageTrackingData job-id
+                (merge tracking-data { pickup-verified: true }))
+            (if (is-eq event-type EVENT_DELIVERY_COMPLETED)
+                (map-set PackageTrackingData job-id
+                    (merge tracking-data { delivery-verified: true }))
+                true
+            )
+        )
+        
+        (ok new-event-id)
+    )
+)
+
+;; Submit proof of delivery with photos and signature
+(define-public (submit-delivery-proof
+    (job-id uint)
+    (pickup-photo (optional (string-ascii 64)))
+    (delivery-photo (optional (string-ascii 64)))
+    (signature-hash (optional (string-ascii 64)))
+    (condition-rating uint)
+    (confirmation-code (string-ascii 10))
+    (witness (optional principal)))
+    (let
+        (
+            (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+            (tracking-data (unwrap! (map-get? PackageTrackingData job-id) err-not-found))
+        )
+        ;; Only courier can submit delivery proof
+        (asserts! (is-eq (some tx-sender) (get courier job)) err-unauthorized)
+        (asserts! (is-eq (get status job) STATUS_IN_TRANSIT) err-invalid-status)
+        (asserts! (get tracking-active tracking-data) err-tracking-not-active)
+        (asserts! (and (>= condition-rating u1) (<= condition-rating u5)) err-invalid-condition-rating)
+        
+        ;; Ensure proof hasn't been submitted already
+        (asserts! (is-none (map-get? DeliveryProofs job-id)) err-proof-already-submitted)
+        
+        ;; Store delivery proof
+        (map-set DeliveryProofs job-id
+            {
+                pickup-photo-hash: pickup-photo,
+                delivery-photo-hash: delivery-photo,
+                recipient-signature-hash: signature-hash,
+                package-condition-rating: condition-rating,
+                delivery-confirmation-code: confirmation-code,
+                proof-timestamp: stacks-block-height,
+                witness-address: witness
+            }
+        )
+        
+        (ok true)
+    )
+)
+
+;; Verify delivery proof by customer
+(define-public (verify-delivery-proof (job-id uint) (confirmation-code (string-ascii 10)))
+    (let
+        (
+            (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+            (proof (unwrap! (map-get? DeliveryProofs job-id) err-not-found))
+            (tracking-data (unwrap! (map-get? PackageTrackingData job-id) err-not-found))
+        )
+        ;; Only customer can verify proof
+        (asserts! (is-eq tx-sender (get customer job)) err-unauthorized)
+        (asserts! (is-eq (get delivery-confirmation-code proof) confirmation-code) err-unauthorized)
+        
+        ;; Mark delivery as verified
+        (map-set PackageTrackingData job-id
+            (merge tracking-data { 
+                delivery-verified: true,
+                tracking-active: false
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+;; Report package exception or issue
+(define-public (report-package-exception
+    (job-id uint)
+    (exception-type (string-ascii 50))
+    (description (string-ascii 100))
+    (photo-evidence (optional (string-ascii 64))))
+    (let
+        (
+            (job (unwrap! (map-get? DeliveryJobs job-id) err-not-found))
+            (tracking-data (unwrap! (map-get? PackageTrackingData job-id) err-not-found))
+            (current-counter (default-to u0 (map-get? TrackingCounters job-id)))
+            (new-event-id (+ current-counter u1))
+        )
+        ;; Either customer or courier can report exceptions
+        (asserts! (or 
+            (is-eq tx-sender (get customer job))
+            (is-eq (some tx-sender) (get courier job))) err-unauthorized)
+        (asserts! (get tracking-active tracking-data) err-tracking-not-active)
+        
+        ;; Record exception event
+        (map-set TrackingEvents { job-id: job-id, event-id: new-event-id }
+            {
+                event-type: EVENT_EXCEPTION_OCCURRED,
+                timestamp: stacks-block-height,
+                location-coords: "Unknown",
+                location-description: exception-type,
+                courier: (default-to tx-sender (get courier job)),
+                photo-hash: photo-evidence,
+                notes: description,
+                verified: false ;; Exceptions need manual verification
+            }
+        )
+        
+        ;; Update event counter
+        (map-set TrackingCounters job-id new-event-id)
+        
+        (ok new-event-id)
+    )
+)
+
+;; Read-only functions for tracking data
+
+(define-read-only (get-package-tracking-data (job-id uint))
+    (map-get? PackageTrackingData job-id)
+)
+
+(define-read-only (get-tracking-event (job-id uint) (event-id uint))
+    (map-get? TrackingEvents { job-id: job-id, event-id: event-id })
+)
+
+(define-read-only (get-delivery-proof (job-id uint))
+    (map-get? DeliveryProofs job-id)
+)
+
+(define-read-only (get-total-tracking-events (job-id uint))
+    (default-to u0 (map-get? TrackingCounters job-id))
+)
+
+(define-read-only (is-package-tracking-active (job-id uint))
+    (match (map-get? PackageTrackingData job-id)
+        tracking-data (get tracking-active tracking-data)
+        false
+    )
+)
+
+(define-read-only (get-package-verification-status (job-id uint))
+    (match (map-get? PackageTrackingData job-id)
+        tracking-data (ok {
+            pickup-verified: (get pickup-verified tracking-data),
+            delivery-verified: (get delivery-verified tracking-data),
+            tracking-active: (get tracking-active tracking-data)
+        })
+        err-not-found
+    )
+)
